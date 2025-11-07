@@ -22,7 +22,7 @@ import textwrap
 import zlib
 import gzip
 
-from .common_imports import etree, HelperTestCase
+from .common_imports import etree, HelperTestCase, needs_feature
 from .common_imports import fileInTestDir, fileUrlInTestDir, read_file, path2url, tmpfile
 from .common_imports import SillyFileLike, LargeFileLikeUnicode, doctest, make_doctest
 from .common_imports import canonicalize, _str, _bytes
@@ -33,7 +33,9 @@ TESTED VERSION: {etree.__version__}
     Python:           {tuple(sys.version_info)!r}
     lxml.etree:       {etree.LXML_VERSION!r}
     libxml used:      {etree.LIBXML_VERSION!r}
+           features:  {' '.join(sorted(etree.LIBXML_FEATURES))}
     libxml compiled:  {etree.LIBXML_COMPILED_VERSION!r}
+           features:  {' '.join(sorted(etree.LIBXML_COMPILED_FEATURES))}
     libxslt used:     {etree.LIBXSLT_VERSION!r}
     libxslt compiled: {etree.LIBXSLT_COMPILED_VERSION!r}
     iconv compiled:   {etree.ICONV_COMPILED_VERSION!r}
@@ -62,6 +64,12 @@ class ETreeOnlyTestCase(HelperTestCase):
     def test_libxml_features(self):
         self.assertIsInstance(etree.LIBXML_FEATURES, set)
         self.assertTrue(etree.LIBXML_FEATURES)
+        self.assertIn("xpath", etree.LIBXML_FEATURES)
+
+    def test_libxml_compiled_features(self):
+        self.assertIsInstance(etree.LIBXML_COMPILED_FEATURES, set)
+        self.assertTrue(etree.LIBXML_COMPILED_FEATURES)
+        self.assertIn("xpath", etree.LIBXML_COMPILED_FEATURES)
 
     def test_c_api(self):
         if hasattr(self.etree, '__pyx_capi__'):
@@ -714,6 +722,14 @@ class ETreeOnlyTestCase(HelperTestCase):
         parse = self.etree.parse
         self.assertRaises(TypeError, parse, 'notthere.xml', object())
 
+    def test_parse_huge_tree(self):
+        fromstring = self.etree.fromstring
+        XMLParser = self.etree.XMLParser
+
+        xml = b'<a><b></b><c/></a>'
+        parser = XMLParser(huge_tree=True)
+        self.assertEqual(2, len(fromstring(xml, parser=parser)))
+
     def test_parse_premature_end(self):
         fromstring = self.etree.fromstring
         XMLParser = self.etree.XMLParser
@@ -740,6 +756,17 @@ class ETreeOnlyTestCase(HelperTestCase):
             counts.append(len(list(elem.getiterator())))
         self.assertEqual(
             [1,2,1,4],
+            counts)
+
+    def test_iterparse_huge_tree(self):
+        iterparse = self.etree.iterparse
+        f = BytesIO(b'<a><b><d/></b><c/></a>')
+
+        counts = []
+        for _, elem in iterparse(f, huge_tree=True):
+            counts.append(len(elem))
+        self.assertEqual(
+            [0,1,0,2],
             counts)
 
     def test_iterparse_tree_comments(self):
@@ -1821,6 +1848,30 @@ class ETreeOnlyTestCase(HelperTestCase):
                 break
         else:
             self.assertFalse("entity error not found in parser error log")
+
+    def test_entity_parse_xxe(self):
+        fromstring = self.etree.fromstring
+        tostring = self.etree.tostring
+        xml = textwrap.dedent("""\
+        <?xml version="1.0" encoding="UTF-8"?>
+            <!DOCTYPE msg [
+                <!ENTITY % a '
+                    <!ENTITY &#x25; file SYSTEM "{FILE}">
+                    <!ENTITY &#x25; b "<!ENTITY c &#x27;&#x25;file;&#x27;>">
+                '>
+                %a;
+                %b;
+        ]>
+        <msg>&c;</msg>
+        """).format(FILE=fileUrlInTestDir("test-string.xml")).encode('UTF-8')
+
+        try:
+            root = fromstring(xml)
+        except self.etree.XMLSyntaxError:
+            # This is the normal outcome - we should never access the external file.
+            pass
+        else:
+            self.assertNotIn("Søk på nettet", tostring(root, encoding="unicode"))
 
     def test_entity_restructure(self):
         xml = b'''<!DOCTYPE root [ <!ENTITY nbsp "&#160;"> ]>
@@ -4916,6 +4967,52 @@ class ETreeOnlyTestCase(HelperTestCase):
         events = list(iterparse(SimpleFSPath(fileInTestDir('test.xml'))))
         self.assertEqual(2, len(events))
 
+    def test_class_hierarchy(self):
+        element = etree.Element("test")
+        # The Element class constructs an _Element instance
+        self.assertIs(type(element), etree._Element)
+        # _Element is a subclass implementation of Element
+        self.assertTrue(issubclass(etree._Element, etree.Element))
+        # Therefore, element is an instance of Element
+        self.assertIsInstance(element, etree.Element)
+
+        comment = etree.Comment("text")
+        self.assertIs(type(comment), etree._Comment)
+        self.assertIsInstance(comment, etree._Element)
+        self.assertIsInstance(comment, etree.Element)
+
+        pi = etree.ProcessingInstruction("target", "text")
+        self.assertIs(type(pi), etree._ProcessingInstruction)
+        self.assertIsInstance(pi, etree._Element)
+        self.assertIsInstance(pi, etree.Element)
+
+        entity = etree.Entity("text")
+        self.assertIs(type(entity), etree._Entity)
+        self.assertIsInstance(entity, etree._Element)
+        self.assertIsInstance(entity, etree.Element)
+
+        sub_element = etree.SubElement(element, "child")
+        self.assertIs(type(sub_element), etree._Element)
+        self.assertIsInstance(sub_element, etree.Element)
+
+        tree = etree.ElementTree(element)
+        self.assertIs(type(tree), etree._ElementTree)
+        self.assertIsInstance(tree, etree.ElementTree)
+        self.assertNotIsInstance(tree, etree._Element)
+
+        # XML is a factory function and not a class.
+        xml = etree.XML("<root><test/></root>")
+        self.assertIs(type(xml), etree._Element)
+        self.assertIsInstance(xml, etree._Element)
+        self.assertIsInstance(xml, etree.Element)
+
+        self.assertNotIsInstance(element, etree.ElementBase)
+        self.assertIs(type(element), etree._Element)
+        self.assertTrue(issubclass(etree.ElementBase, etree._Element))
+
+        self.assertTrue(callable(etree.Element))
+        self.assertTrue(callable(etree.ElementTree))
+
     # helper methods
 
     def _writeElement(self, element, encoding='us-ascii', compression=0):
@@ -5543,14 +5640,17 @@ class ETreeWriteTestCase(HelperTestCase):
         self.assertEqual(b'<a>'+b'<b/>'*200+b'</a>',
                         data)
 
+    @needs_feature("zlib")
     def test_write_file_gzip_parse(self):
         tree = self.parse(b'<a>'+b'<b/>'*200+b'</a>')
+        parser = etree.XMLParser(decompress=True)
         with tmpfile() as filename:
             tree.write(filename, compression=9)
-            data = etree.tostring(etree.parse(filename))
+            data = etree.tostring(etree.parse(filename, parser))
         self.assertEqual(b'<a>'+b'<b/>'*200+b'</a>',
                           data)
 
+    @needs_feature("zlib")
     def test_write_file_gzipfile_parse(self):
         tree = self.parse(b'<a>'+b'<b/>'*200+b'</a>')
         with tmpfile() as filename:
@@ -5756,7 +5856,18 @@ def test_suite():
     suite.addTests(doctest.DocTestSuite(selftest2))
 
     # add doctests
-    suite.addTests(doctest.DocTestSuite(etree))
+    doctest_stubs = {}
+    if 'schematron' not in etree.LIBXML_COMPILED_FEATURES:
+        # See doctest of class "lxml.etree.Schematron".
+        class FakeSchematron:
+            def __init__(self, schema):
+                self._results = iter([0, 1])
+            def validate(self, xml):
+                return next(self._results)
+
+        doctest_stubs['Schematron'] = FakeSchematron
+
+    suite.addTests(doctest.DocTestSuite(etree, extraglobs=doctest_stubs))
     suite.addTests(
         [make_doctest('tutorial.txt')])
     suite.addTests(

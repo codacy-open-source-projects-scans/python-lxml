@@ -1,6 +1,6 @@
 # this is a package
 
-__version__ = "5.3.0"
+__version__ = "7.0.0a0"
 
 
 def get_include():

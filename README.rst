@@ -63,19 +63,20 @@ Crypto currencies do not fit into that ambition.
 .. _`doc/main.txt`: https://github.com/lxml/lxml/blob/master/doc/main.txt
 .. _`INSTALL.txt`: http://lxml.de/installation.html
 
-`AppVeyor <https://www.appveyor.com/>`_ and `GitHub Actions <https://docs.github.com/en/actions>`_
-support the lxml project with their build and CI servers.
-Jetbrains supports the lxml project by donating free licenses of their
-`PyCharm IDE <https://www.jetbrains.com/pycharm/>`_.
-Another supporter of the lxml project is
-`COLOGNE Webdesign <https://www.colognewebdesign.de/>`_.
+`GitHub Actions <https://docs.github.com/en/actions>`_
+supports the lxml project with their build and CI servers.
 
 
 Project income report
 ---------------------
 
-lxml has `about 80 million downloads <https://pypistats.org/packages/lxml>`_
+lxml has `well over 100 million downloads <https://pypistats.org/packages/lxml>`_
 per month on PyPI.
+
+* Total project income in 2024: EUR 2826.29  (235.52 € / month, 1.96 € / 1,000,000 downloads)
+
+  - Tidelift: EUR 2777.34
+  - Paypal: EUR 48.95
 
 * Total project income in 2023: EUR 2776.56  (231.38 € / month, 2.89 € / 1,000,000 downloads)
 

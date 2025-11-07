@@ -62,6 +62,7 @@ cdef _initXSLTResolverContext(_XSLTResolverContext context,
     context._parser = parser
     context._c_style_doc = NULL
 
+
 cdef xmlDoc* _xslt_resolve_from_python(const_xmlChar* c_uri, void* c_context,
                                        int parse_options, int* error) with gil:
     # call the Python document loaders
@@ -101,6 +102,7 @@ cdef xmlDoc* _xslt_resolve_from_python(const_xmlChar* c_uri, void* c_context,
                     doc_ref._file, doc_ref._filename, context._parser)
             elif doc_ref._type == PARSER_DATA_EMPTY:
                 c_return_doc = _newXMLDoc()
+                context._parser.initDocDict(c_return_doc)
             if c_return_doc is not NULL and c_return_doc.URL is NULL:
                 c_return_doc.URL = tree.xmlStrdup(c_uri)
     except:
@@ -521,17 +523,17 @@ cdef class XSLT:
         # non-input tag/attr names will come from the stylesheet
         # anyway.
         if transform_ctxt.dict is not NULL:
-            xmlparser.xmlDictFree(transform_ctxt.dict)
+            tree.xmlDictFree(transform_ctxt.dict)
         if kw:
             # parameter values are stored in the dict
             # => avoid unnecessarily cluttering the global dict
-            transform_ctxt.dict = xmlparser.xmlDictCreateSub(self._c_style.doc.dict)
+            transform_ctxt.dict = tree.xmlDictCreateSub(self._c_style.doc.dict)
             if transform_ctxt.dict is NULL:
                 xslt.xsltFreeTransformContext(transform_ctxt)
                 raise MemoryError()
         else:
             transform_ctxt.dict = self._c_style.doc.dict
-            xmlparser.xmlDictReference(transform_ctxt.dict)
+            tree.xmlDictReference(transform_ctxt.dict)
 
         xslt.xsltSetCtxtParseOptions(
             transform_ctxt, input_doc._parser._parse_options)
@@ -598,11 +600,12 @@ cdef class XSLT:
             if resolver_context is not None:
                 resolver_context.clear()
 
-        result_doc = _documentFactory(c_result, input_doc._parser)
-
         c_dict = c_result.dict
-        xmlparser.xmlDictReference(c_dict)
-        __GLOBAL_PARSER_CONTEXT.initThreadDictRef(&c_result.dict)
+        tree.xmlDictReference(c_dict)
+
+        result_doc = _documentFactory(c_result, input_doc._parser)
+        result_doc.initDict()
+
         if c_dict is not c_result.dict or \
                 self._c_style.doc.dict is not c_result.dict or \
                 input_doc._c_doc.dict is not c_result.dict:
@@ -616,7 +619,8 @@ cdef class XSLT:
                 if input_doc._c_doc.dict is not c_result.dict:
                     fixThreadDictNames(<xmlNode*>c_result,
                                        input_doc._c_doc.dict, c_result.dict)
-        xmlparser.xmlDictFree(c_dict)
+
+        tree.xmlDictFree(c_dict)
 
         return _xsltResultTreeFactory(result_doc, self, profile_doc)
 
@@ -664,9 +668,16 @@ cdef _convert_xslt_parameters(xslt.xsltTransformContext* transform_ctxt,
                     v = (<XPath>value)._path
                 else:
                     v = _utf8(value)
-                params[i] = <const_char*>tree.xmlDictLookup(c_dict, _xcstr(k), len(k))
+
+                c_len = len(k)
+                if c_len > limits.INT_MAX:
+                    raise ValueError("Parameter name too long")
+                params[i] = <const_char*> tree.xmlDictLookup(c_dict, _xcstr(k), <int> c_len)
                 i += 1
-                params[i] = <const_char*>tree.xmlDictLookup(c_dict, _xcstr(v), len(v))
+                c_len = len(v)
+                if c_len > limits.INT_MAX:
+                    raise ValueError("Parameter value too long")
+                params[i] = <const_char*> tree.xmlDictLookup(c_dict, _xcstr(v), <int> c_len)
                 i += 1
     except:
         python.lxml_free(params)
@@ -732,7 +743,7 @@ cdef class _XSLTResultTree(_ElementTree):
                 raise XSLTSaveError("No document to serialise")
         c_compression = compression or 0
         xslt.LXML_GET_XSLT_ENCODING(c_encoding, self._xslt._c_style)
-        writer = _create_output_buffer(file, <const_char*>c_encoding, compression, &c_buffer, close=False)
+        writer = _create_output_buffer(file, <const_char*>c_encoding, c_compression, &c_buffer, close=False)
         if writer is None:
             with nogil:
                 r = xslt.xsltSaveResultTo(c_buffer, doc._c_doc, self._xslt._c_style)

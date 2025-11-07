@@ -476,6 +476,50 @@ cdef _write_attr_string(tree.xmlOutputBuffer* buf, const char *string):
         tree.xmlOutputBufferWrite(buf, cur - base, base)
 
 
+cdef void _write_cdata_section(tree.xmlOutputBuffer* buf, const char* c_data, const char* c_end):
+    tree.xmlOutputBufferWrite(buf, 9, "<![CDATA[")
+    while c_end - c_data > limits.INT_MAX:
+        tree.xmlOutputBufferWrite(buf, limits.INT_MAX, c_data)
+        c_data += limits.INT_MAX
+    tree.xmlOutputBufferWrite(buf, c_end - c_data, c_data)
+    tree.xmlOutputBufferWrite(buf, 3, "]]>")
+
+
+cdef _write_cdata_string(tree.xmlOutputBuffer* buf, bytes bstring):
+    cdef const char* c_data = bstring
+    cdef const char* c_end = c_data + len(bstring)
+    cdef const char* c_pos = c_data
+    cdef bint nothing_written = True
+
+    while True:
+        c_pos = <const char*> cstring_h.memchr(c_pos, b']', c_end - c_pos)
+        if not c_pos:
+            break
+        c_pos += 1
+        next_char = c_pos[0]
+        c_pos += 1
+        if next_char != b']':
+            continue
+        # Found ']]', c_pos points to next character.
+        while c_pos[0] == b']':
+            c_pos += 1
+        if c_pos[0] != b'>':
+            if c_pos == c_end:
+                break
+            # c_pos[0] is neither ']' nor '>', continue with next character.
+            c_pos += 1
+            continue
+
+        # Write section up to ']]' and start next block at trailing '>'.
+        _write_cdata_section(buf, c_data, c_pos)
+        nothing_written = False
+        c_data = c_pos
+        c_pos += 1
+
+    if nothing_written or c_data < c_end:
+        _write_cdata_section(buf, c_data, c_end)
+
+
 ############################################################
 # output to file-like objects
 
@@ -514,19 +558,66 @@ def _open_utf8_file(file, compression=0):
 
 @cython.final
 @cython.internal
+cdef class _SlidingMemoryView:
+    cdef char *buffer
+    cdef Py_ssize_t length
+    cdef stdint.uintptr_t used
+
+    cdef int point_buffer(self, char* data, Py_ssize_t length):
+        if self.used:
+            raise RuntimeError, f"Buffer object is not free to use, {self.used:d} references found"
+        self.buffer = data
+        self.length = length
+        return 0
+
+    def __getbuffer__(self, Py_buffer* info, int flags):
+        assert (flags | PyBUF_READ | PyBUF_FORMAT | PyBUF_ND | PyBUF_STRIDES) == (PyBUF_SIMPLE | PyBUF_READ | PyBUF_FORMAT | PyBUF_ND | PyBUF_STRIDES), flags
+        assert self.buffer is not NULL
+
+        self.used += 1
+
+        info.obj = self
+        info.buf = self.buffer
+        info.len = self.length
+        info.itemsize = 1
+        info.readonly = 1
+        info.ndim = 1
+        info.format = b'B'
+        info.shape = &info.itemsize
+        info.strides = &info.itemsize
+        info.suboffsets = NULL
+        info.internal = NULL
+
+    def __releasebuffer__(self, Py_buffer* info):
+        info.buf = NULL
+        self.used -= 1
+
+
+@cython.final
+@cython.internal
 cdef class _FilelikeWriter:
     cdef object _filelike
     cdef object _close_filelike
+    cdef _SlidingMemoryView _mview
     cdef _ExceptionContext _exc_context
     cdef _ErrorLog error_log
-    def __cinit__(self, filelike, exc_context=None, compression=None, close=False):
+
+    def __cinit__(self, filelike, exc_context=None, compression=None, bint close=False):
+        cdef bint use_mview
         if compression is not None and compression > 0:
             filelike = GzipFile(
                 fileobj=filelike, mode='wb', compresslevel=compression)
-            self._close_filelike = filelike.close
-        elif close:
-            self._close_filelike = filelike.close
+            use_mview = True
+            close = True
+        else:
+            use_mview = not python.IS_PYPY and isinstance(filelike, (BufferedWriter, BytesIO))
+
         self._filelike = filelike
+        if close:
+            self._close_filelike = filelike.close
+        if not python.IS_PYPY and use_mview:
+            self._mview = _SlidingMemoryView()
+
         if exc_context is None:
             self._exc_context = _ExceptionContext()
         else:
@@ -547,8 +638,13 @@ cdef class _FilelikeWriter:
         try:
             if self._filelike is None:
                 raise IOError, "File is already closed"
-            py_buffer = <bytes>c_buffer[:size]
-            self._filelike.write(py_buffer)
+            # If we don't know what the 'filelike' does with the data object, we pass it as plain 'bytes' copy.
+            if self._mview is None:
+                py_buffer = <bytes>c_buffer[:size]
+                self._filelike.write(py_buffer)
+            else:
+                self._mview.point_buffer(c_buffer, size)
+                self._filelike.write(self._mview)
         except:
             size = -1
             self._exc_context._store_raised()
@@ -568,11 +664,13 @@ cdef class _FilelikeWriter:
         finally:
             return retval  # and swallow any further exceptions
 
+
 cdef int _writeFilelikeWriter(void* ctxt, char* c_buffer, int length) noexcept:
     return (<_FilelikeWriter>ctxt).write(c_buffer, length)
 
 cdef int _closeFilelikeWriter(void* ctxt) noexcept:
     return (<_FilelikeWriter>ctxt).close()
+
 
 cdef _tofilelike(f, _Element element, encoding, doctype, method,
                  bint write_xml_declaration, bint write_doctype,
@@ -653,12 +751,19 @@ cdef _FilelikeWriter _create_output_buffer(
     cdef tree.xmlOutputBuffer* c_buffer
     cdef _FilelikeWriter writer
     cdef bytes filename8
+
     enchandler = tree.xmlFindCharEncodingHandler(c_enc)
     if enchandler is NULL:
         raise LookupError(
             f"unknown encoding: '{c_enc.decode('UTF-8') if c_enc is not NULL else u''}'")
     try:
         f = _getFSPathOrObject(f)
+
+        if c_compression and not HAS_ZLIB_COMPRESSION and _isString(f):
+            # Let "_FilelikeWriter" fall back to Python's GzipFile.
+            f = open(f, mode="wb")
+            close = True
+
         if _isString(f):
             filename8 = _encodeFilename(f)
             if b'%' in filename8 and (
@@ -685,6 +790,7 @@ cdef _FilelikeWriter _create_output_buffer(
     c_buffer_ret[0] = c_buffer
     return writer
 
+
 cdef xmlChar **_convert_ns_prefixes(tree.xmlDict* c_dict, ns_prefixes) except NULL:
     cdef size_t i, num_ns_prefixes = len(ns_prefixes)
     # Need to allocate one extra memory block to handle last NULL entry
@@ -695,7 +801,10 @@ cdef xmlChar **_convert_ns_prefixes(tree.xmlDict* c_dict, ns_prefixes) except NU
     try:
         for prefix in ns_prefixes:
              prefix_utf = _utf8(prefix)
-             c_prefix = tree.xmlDictExists(c_dict, _xcstr(prefix_utf), len(prefix_utf))
+             c_prefix_len = len(prefix_utf)
+             if c_prefix_len > limits.INT_MAX:
+                raise ValueError("Prefix too long")
+             c_prefix = tree.xmlDictExists(c_dict, _xcstr(prefix_utf), <int> c_prefix_len)
              if c_prefix:
                  # unknown prefixes do not need to get serialised
                  c_ns_prefixes[i] = <xmlChar*>c_prefix
@@ -706,6 +815,7 @@ cdef xmlChar **_convert_ns_prefixes(tree.xmlDict* c_dict, ns_prefixes) except NU
 
     c_ns_prefixes[i] = NULL  # append end marker
     return c_ns_prefixes
+
 
 cdef _tofilelikeC14N(f, _Element element, bint exclusive, bint with_comments,
                      int compression, inclusive_ns_prefixes):
@@ -725,6 +835,13 @@ cdef _tofilelikeC14N(f, _Element element, bint exclusive, bint with_comments,
             if inclusive_ns_prefixes else NULL)
 
         f = _getFSPathOrObject(f)
+
+        close = False
+        if compression and not HAS_ZLIB_COMPRESSION and _isString(f):
+            # Let "_FilelikeWriter" fall back to Python's GzipFile.
+            f = open(f, mode="wb")
+            close = True
+
         if _isString(f):
             filename8 = _encodeFilename(f)
             c_filename = _cstr(filename8)
@@ -733,7 +850,7 @@ cdef _tofilelikeC14N(f, _Element element, bint exclusive, bint with_comments,
                     c_doc, NULL, exclusive, c_inclusive_ns_prefixes,
                     with_comments, c_filename, compression)
         elif hasattr(f, 'write'):
-            writer   = _FilelikeWriter(f, compression=compression)
+            writer   = _FilelikeWriter(f, compression=compression, close=close)
             c_buffer = writer._createOutputBuffer(NULL)
             try:
                 with writer.error_log:
@@ -1556,6 +1673,11 @@ cdef class _IncrementalFileWriter:
                 else:
                     tree.xmlOutputBufferWriteEscape(self._c_out, _xcstr(bstring), NULL)
 
+            elif isinstance(content, CDATA):
+                if self._status > WRITER_IN_ELEMENT:
+                    raise LxmlSyntaxError("not in an element")
+                _write_cdata_string(self._c_out, (<CDATA>content)._utf8_data)
+
             elif iselement(content):
                 if self._status > WRITER_IN_ELEMENT:
                     raise LxmlSyntaxError("cannot append trailing element to complete XML document")
@@ -1568,8 +1690,10 @@ cdef class _IncrementalFileWriter:
 
             elif content is not None:
                 raise TypeError(
-                    f"got invalid input value of type {type(content)}, expected string or Element")
+                    f"got invalid input value of type {type(content)}, expected string, CDATA or Element")
+
             self._handle_error(self._c_out.error)
+
         if not self._buffered:
             tree.xmlOutputBufferFlush(self._c_out)
             self._handle_error(self._c_out.error)
