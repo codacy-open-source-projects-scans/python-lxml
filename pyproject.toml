@@ -1,5 +1,5 @@
 [build-system]
-requires = ["Cython>=3.1.4", "setuptools"]
+requires = ["Cython>=3.2.2", "setuptools"]
 
 [tool.cibuildwheel]
 build-verbosity = 1
@@ -9,30 +9,15 @@ enable = ["pypy", "cpython-prerelease"]
        # "cpython-prerelease"
        # "cpython-freethreading"
 skip = [
-    "cp36-*",
-    "pp36-",
-    "cp37-*",
-    "pp37-*",
+    "cp38-*",
     "pp38-*",
     "pp*-manylinux_i686",
     "*-musllinux_i686",
-    # Py3.8 wheel for macos is not universal: https://bugs.launchpad.net/lxml/+bug/2055404
-    "cp38-macosx_universal2",
     # Reduce job load and HTTP hit rate on library servers.
-    "cp38-*_aarch64",
-    "cp38-*_armv7l",
-
-    "cp38-*_ppc64le",
-    "cp39-*_ppc64le",
-    "cp310-*_ppc64le",
-    "cp311-*_ppc64le",
-
-    "cp38-*_riscv64",
-
-    "cp38-*_s390x",
     "cp39-*_s390x",
 ]
 #test-command = "python {package}/test.py -vv"
+#test-command = "python -c 'import lxml.etree, lxml.objectify, lxml.html'"
 
 [tool.cibuildwheel.linux]
 #archs = ["x86_64", "aarch64", "i686", "ppc64le", "s390x", "armv7l"]
@@ -64,8 +49,22 @@ select = "*linux_aarch64"
 inherit.environment = "append"
 environment.CFLAGS = "-O3 -g1 -pipe -fPIC -flto -march=armv8-a -mtune=cortex-a72"
 
+[[tool.cibuildwheel.overrides]]
+select = "*i686 *musllinux* *win32 *win_arm64 *macosx_x86_64 *linux_armv7l *linux_ppc64le *linux_riscv64"
+inherit.environment = "append"
+environment.LXML_LIMITED_API = "true"
+inherit.test-requires = "append"
+test-requires = ["abi3audit>=0.0.24"]
+inherit.test-command = "append"
+test-command = ["abi3audit --strict --verbose {wheel}"]
+
+[[tool.cibuildwheel.overrides]]
+select = "cp39*"
+# abi3audit 0.0.23 no longer supports Py3.9
+test-requires = ["abi3audit>=0.0.22"]
+
 [tool.cibuildwheel.windows]
-archs = ["AMD64", "x86"]
+archs = ["AMD64", "x86", "ARM64"]
 
 [tool.cibuildwheel.macos]
 # https://cibuildwheel.readthedocs.io/en/stable/faq/#what-to-provide suggests to provide
